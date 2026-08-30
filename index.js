@@ -16,6 +16,7 @@ let isStarting = false;
 
 // Holds the most recently generated pairing code so the web UI can poll for it.
 global.latestPairingCode = null;
+global.pairingError = null;
 global.connectionStatus = 'disconnected'; // disconnected | connecting | connected
 
 async function startBot(phoneNumber) {
@@ -36,19 +37,33 @@ async function startBot(phoneNumber) {
 
   global.connectionStatus = 'connecting';
 
-  // Request a pairing code only if this device isn't registered yet
+  // Request a pairing code only if this device isn't registered yet.
+  // Baileys needs the underlying websocket fully connected first, or the
+  // request throws "Connection Closed" (428) — so we retry a few times
+  // with a growing delay instead of a single fixed wait.
   if (!sock.authState.creds.registered && phoneNumber) {
-    setTimeout(async () => {
-      try {
-        const cleanNumber = phoneNumber.replace(/[^0-9]/g, '');
-        const code = await sock.requestPairingCode(cleanNumber);
-        global.latestPairingCode = code;
-        console.log('📱 Pairing code:', code);
-      } catch (err) {
-        console.error('Failed to generate pairing code:', err.message);
-        global.latestPairingCode = null;
+    global.pairingError = null;
+    (async () => {
+      const cleanNumber = phoneNumber.replace(/[^0-9]/g, '');
+      const delays = [2000, 3000, 4000, 5000, 6000]; // ~20s of retrying total
+      for (const delay of delays) {
+        await new Promise((r) => setTimeout(r, delay));
+        try {
+          const code = await sock.requestPairingCode(cleanNumber);
+          global.latestPairingCode = code;
+          console.log('📱 Pairing code:', code);
+          return;
+        } catch (err) {
+          console.error(`Pairing attempt failed (retrying): ${err.message}`);
+          // keep looping unless the socket itself died — connection.update
+          // handler will restart everything in that case
+          if (!sock || sock?.ws?.readyState === 3 /* CLOSED */) break;
+        }
       }
-    }, 3000);
+      global.latestPairingCode = null;
+      global.pairingError = 'Could not reach WhatsApp servers after several attempts. Check the number format and try again.';
+      isStarting = false; // allow a fresh retry from the UI
+    })();
   }
 
   sock.ev.on('creds.update', saveCreds);
@@ -114,4 +129,11 @@ async function startBot(phoneNumber) {
   return sock;
 }
 
-module.exports = { startBot, getSock: () => sock };
+function resetForRetry() {
+  isStarting = false;
+  sock = null;
+  global.latestPairingCode = null;
+  global.pairingError = null;
+}
+
+module.exports = { startBot, getSock: () => sock, resetForRetry };
